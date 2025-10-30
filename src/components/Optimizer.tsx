@@ -1,21 +1,25 @@
 "use client";
 
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { Card, CardContent } from "./ui/card";
 import { Slider } from "./ui/slider";
 import { Switch } from "./ui/switch";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
-import { TooltipProvider } from "./ui/tooltip";
-import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as RTooltip, ReferenceLine, BarChart, Bar } from "recharts";
+import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from "./ui/tooltip";
 import { motion } from "framer-motion";
-import { Info } from "lucide-react";
-import { CARD_RULES, TargetKey, CardKey, TARGET_MILES } from "../lib/constants";
+import { CARD_RULES, TargetKey, CardKey } from "../lib/constants";
 import { clamp, r0, r2, fmtTHB, fmt } from "../lib/utils";
 
-const EXCLUDED_MCCS = "MCC 5411 (supermarkets), MCC 5541 (gasoline), MCC 4900 (utilities), all e-wallet top-ups, PayAnything, Makro, spending in THB at overseas merchants, tax refunds, interest, and fees";
+import SpendPanel from "./Optimizer/SpendPanel";
+import CapPanel from "./Optimizer/CapPanel";
+import MilesAccrualChart from "./Optimizer/MilesAccrualChart";
+import InfoPanels from "./Optimizer/InfoPanels";
+import InfoAccordion from "./Optimizer/InfoPanels";
+import { useNormalizedShares, useSimulation, useChosenTargetMiles, useSolveForTarget } from "./Optimizer/hooks";
+import BeginnerExplainerModal from "./BeginnerExplainerModal";
+import { RequiredSpendPanel, CompareSpendPanel } from "./Optimizer/SpendPanel";
 
 const Optimizer: React.FC = () => {
   const [card, setCard] = useState<CardKey>("elite");
@@ -29,22 +33,28 @@ const Optimizer: React.FC = () => {
   const [includeAnnualBonus, setIncludeAnnualBonus] = useState(true);
   const [includeSignupBonus, setIncludeSignupBonus] = useState(card==="world");
   const [devaluationPct, setDevaluationPct] = useState(0);
-  const [estTaxesFeesTHB, setEstTaxesFeesTHB] = useState(8000);
   const [cyclesToSim, setCyclesToSim] = useState(24);
-  const [simpleMode, setSimpleMode] = useState(true);
+  const [showExplainer, setShowExplainer] = useState(false);
+
+  // Show explainer modal on first visit or ?beginner=1
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('beginner') === '1') {
+      setShowExplainer(true);
+      return;
+    }
+    if (!localStorage.getItem("kf.beginnerSeen")) {
+      setShowExplainer(true);
+    }
+  }, []);
 
   const rules = CARD_RULES[card];
-  const normShares = useMemo(() => {
-    const s = clamp(shareSQ, 0, 100);
-    const f = clamp(shareFX, 0, 100 - s);
-    const o = 100 - s - f;
-    return { s, f, o };
-  }, [shareSQ, shareFX]);
+  const normShares = useNormalizedShares(shareSQ, shareFX);
+  const chosenTargetMiles = useChosenTargetMiles({ useCustomTarget, customMiles, target, devaluationPct });
+  const sim = useSimulation({ cyclesToSim, monthlySpendTHB, normShares, includeAnnualBonus, includeSignupBonus, rules, card });
+  const pointChosen = useSolveForTarget(sim, chosenTargetMiles);
 
-  const chosenTargetMiles = useMemo(() => {
-    return (useCustomTarget ? customMiles : TARGET_MILES[target]) * (1 + devaluationPct / 100);
-  }, [useCustomTarget, customMiles, target, devaluationPct]);
-
+  // Direct panel answers
   // Core T&C accurate cycle earn
   function computeCycle(mthSpend: number) {
     const wantSQ = (normShares.s / 100) * mthSpend; // SQ/Scoot/KrisShop
@@ -66,245 +76,182 @@ const Optimizer: React.FC = () => {
   }
 
   // Simulate cycles, showing progress each month (for graph)
-  const sim = useMemo(() => {
-    const months = cyclesToSim;
-    const rows: any[] = [];
-    let cumMiles = 0;
-    let cumSpend = 0;
-    let postedBonus = false;
-    let yearSpend = 0;
-    for (let m = 1; m <= months; m++) {
-      const c = computeCycle(monthlySpendTHB);
-      cumMiles += c.cycleMiles;
-      cumSpend += monthlySpendTHB;
-      yearSpend += monthlySpendTHB;
-      let bonusThisMonth = 0;
-      if (includeAnnualBonus && card==="elite" && !postedBonus && m % 12 === 1 && yearSpend >= rules.annualBonusThresholdTHB && rules.annualBonusMiles > 0) {
-        bonusThisMonth = rules.annualBonusMiles;
-        cumMiles += bonusThisMonth;
-        postedBonus = true;
-      }
-      let signupMiles = 0;
-      if (includeSignupBonus && m === 1 && rules.signupBonusMiles > 0) {
-        signupMiles = rules.signupBonusMiles;
-        cumMiles += signupMiles;
-      }
-      rows.push({
-        month: m,
-        spendTHB: monthlySpendTHB,
-        milesSQ: r2(c.milesSQ),
-        milesFX: r2(c.milesFX),
-        milesOther: r2(c.milesOther),
-        milesThisMonth: r2(c.cycleMiles + bonusThisMonth + signupMiles),
-        cumMiles: r2(cumMiles),
-        cumSpend: r0(cumSpend),
-        bonus: bonusThisMonth,
-        signup: signupMiles,
-      });
-      if (m % 12 === 0) {
-        yearSpend = 0;
-        postedBonus = false;
-      }
-    }
-    return rows;
-  }, [cyclesToSim, monthlySpendTHB, normShares, includeAnnualBonus, includeSignupBonus, rules, card]);
-
   // Find cycles & spend to meet target
-  function solveForTarget(targetMiles: number) {
-    const row = sim.find((r) => r.cumMiles >= targetMiles);
-    if (!row) return null;
-    const months = row.month;
-    const spend = row.cumSpend;
-    const thbPerMile = spend / targetMiles;
-    return { months, spend, thbPerMile };
-  }
-
-  const pointChosen = solveForTarget(chosenTargetMiles);
-
   // Direct panel answers
-  function SpendPanel() {
-    // Best case: 100% at best category up to the cap (no overflow)
-    const milesToGo = chosenTargetMiles - (card==="elite" && includeAnnualBonus ? rules.annualBonusMiles : 0) - (card==="world" && includeSignupBonus ? rules.signupBonusMiles : 0);
-    const rateBest = rules.rateSQ; // For both cards, best rate is SQ/Scoot/KrisShop
-    const spendBest = Math.max(0, milesToGo * rateBest);
-    const cyclesBest = monthlySpendTHB > 0 ? Math.ceil(spendBest / monthlySpendTHB) : 0;
-    const rateFX = rules.rateFX;
-    // If user enters a mix, calculate mix spend required
-    const spendMix = milesToGo / (
-      normShares.s / 100 / rules.rateSQ +
-      normShares.f / 100 / rules.rateFX +
-      normShares.o / 100 / rules.rateOther
-    );
-    const cyclesMix = monthlySpendTHB > 0 ? Math.ceil(spendMix / monthlySpendTHB) : 0;
-    // Worst case: all spend at 1/20
-    const spendWorst = Math.max(0, milesToGo * 20);
-    const cyclesWorst = monthlySpendTHB > 0 ? Math.ceil(spendWorst / monthlySpendTHB) : 0;
-    return (
-      <>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
-          <Card className="rounded-xl border-2 border-emerald-400">
-            <CardContent className="p-4 space-y-1">
-              <div className="text-sm font-semibold text-emerald-700 mb-1">Best-case: 100% at {card === "elite" ? "SQ/Scoot/KrisShop (1/12.5)" : "SQ/Scoot/KrisShop (1/15)"}</div>
-              <div>Spend needed: <span className="font-bold text-lg">{fmtTHB(spendBest)}</span></div>
-              <div className="text-sm text-zinc-500">{cyclesBest} cycles at your monthly spend</div>
-            </CardContent>
-          </Card>
-          <Card className="rounded-xl border-2 border-amber-400">
-            <CardContent className="p-4 space-y-1">
-              <div className="text-sm font-semibold text-amber-700 mb-1">Your current mix ({normShares.s}% SQ/KrisShop, {normShares.f}% Duty Free/FX)</div>
-              <div>Spend needed: <span className="font-bold text-lg">{fmtTHB(spendMix)}</span></div>
-              <div className="text-sm text-zinc-500">{cyclesMix} cycles at your monthly spend</div>
-            </CardContent>
-          </Card>
-          <Card className="rounded-xl border-2 border-rose-400">
-            <CardContent className="p-4 space-y-1">
-              <div className="text-sm font-semibold text-rose-700 mb-1">Worst-case: all spend at 1/20</div>
-              <div>Spend needed: <span className="font-bold text-lg">{fmtTHB(spendWorst)}</span></div>
-              <div className="text-sm text-zinc-500">{cyclesWorst} cycles at your monthly spend</div>
-            </CardContent>
-          </Card>
-        </div>
-        <div className="mb-2 p-3 rounded bg-yellow-50 border-l-4 border-yellow-300 text-yellow-800 text-xs">
-          <span className="font-bold">Warning:</span> Excluded categories (NO miles): {EXCLUDED_MCCS}.
-        </div>
-      </>
-    );
-  }
-
-  // Panel for cap/overflow awareness
-  function CapPanel() {
-    return (
-      <div className="mb-3 text-xs text-zinc-700">
-        <span className="font-bold">Category cap per cycle:</span> <br/>
-        {card === "elite"
-          ? "THB 200,000 for SQ/Scoot/KrisShop, THB 200,000 for Duty Free/FX. Over this, earn drops to 1/20."
-          : "THB 100,000 for SQ/Scoot/KrisShop, THB 50,000 for Duty Free/FX. Over this, earn drops to 1/20."}
-        <br/>
-        Choose a spend mix/amount that keeps as much as possible inside these caps each month for maximum miles!
-      </div>
-    );
-  }
-
-  const expiryWarn = Boolean(pointChosen && pointChosen.months > 34);
 
   return (
     <TooltipProvider>
-      <div className="w-full min-h-screen bg-gradient-to-b from-zinc-50 to-zinc-100 p-4 md:p-8">
-        <div className="max-w-3xl mx-auto space-y-6">
-          <motion.h1 initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} className="text-2xl md:text-4xl font-bold tracking-tight mb-2">
+      <BeginnerExplainerModal open={showExplainer} setOpen={setShowExplainer} />
+      <div className="w-full min-h-screen bg-gradient-to-b from-zinc-50 to-zinc-100 p-2 md:p-8">
+        <div className="max-w-3xl mx-auto space-y-4 md:space-y-6">
+          <motion.h1 initial={{ opacity: 0, y: -16 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }} className="text-2xl md:text-4xl font-bold tracking-tight mb-2 text-center">
             UOB KrisFlyer Spend→Miles Requirement Calculator
           </motion.h1>
-          <div className="text-zinc-600 mb-1">
+          <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.1, duration: 0.4 }} className="text-zinc-600 mb-6 md:mb-8 text-center">
             <span className="font-semibold">How much do I need to spend to get {fmt(r0(chosenTargetMiles))} miles ({useCustomTarget ? 'custom' : target}) on {rules.name}?</span>
-          </div>
-          <div className="flex items-center gap-2 mb-3">
-            <Label>Choose Card:</Label>
-            <Select value={card} onValueChange={(v) => { setCard(v as CardKey); setIncludeSignupBonus(v === "world"); }}>
-              <SelectTrigger className="w-48"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="elite">UOB KrisFlyer World Elite</SelectItem>
-                <SelectItem value="world">UOB KrisFlyer World</SelectItem>
-              </SelectContent>
-            </Select>
-            <Label className="ml-4">Award Target Miles:</Label>
-            <Select value={target} onValueChange={(v) => { setTarget(v as TargetKey); setUseCustomTarget(false); }}>
-              <SelectTrigger className="w-52"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="saver">SQ Saver (122,500)</SelectItem>
-                <SelectItem value="advantage">SQ Advantage (172,000)</SelectItem>
-                <SelectItem value="star">Star Alliance OW (131,000)</SelectItem>
-              </SelectContent>
-            </Select>
-            <div className="flex items-center gap-1 ml-2">
-              <Switch checked={useCustomTarget} onCheckedChange={setUseCustomTarget} />
-              <Label>Custom</Label>
-              <Input type="number" className="w-24 ml-1" value={customMiles} min={0} max={500000} onChange={e => setCustomMiles(clamp(Number(e.target.value), 0, 500000))} disabled={!useCustomTarget} />
+          </motion.div>
+
+          <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.13, duration: 0.4 }}
+            className="flex flex-col items-center justify-center mb-2 md:mb-4">
+            <div className="flex flex-col sm:flex-row gap-4 w-full justify-center items-center mb-2">
+              {[{key: 'elite', label: 'World Elite', img: '/uob-krisflyer-elite.png'}, {key: 'world', label: 'World', img: '/uob-krisflyer-world.png'}].map(cardObj => (
+                <button
+                  key={cardObj.key}
+                  type="button"
+                  onClick={() => { setCard(cardObj.key as CardKey); setIncludeSignupBonus(cardObj.key === 'world'); }}
+                  className={
+                    `flex flex-col items-center transition-all duration-150 rounded-xl border-2 p-1 md:p-2 w-44 md:w-52 shadow-sm hover:shadow-lg ` +
+                    (card === cardObj.key ? 'border-blue-500 shadow-lg scale-105 ring-2 ring-blue-200' : 'border-zinc-200 opacity-80 hover:opacity-100')
+                  }
+                  style={{ background: '#fff' }}
+                  aria-label={cardObj.label + ' Card'}
+                >
+                  <img src={cardObj.img} alt={cardObj.label + ' Card'} className="h-24 md:h-28 w-auto object-contain mb-2 select-none" draggable="false" />
+                  <span className={`block font-semibold text-base ${card === cardObj.key ? 'text-blue-700' : 'text-zinc-700'}`}>{cardObj.label}</span>
+                </button>
+              ))}
             </div>
-          </div>
-          <div className="flex items-center gap-4 mb-6">
-            <Label>Monthly Spend (THB):</Label>
-            <Input type="number" className="w-36" value={monthlySpendTHB} min={0} max={10000000} onChange={e => setMonthlySpendTHB(clamp(Number(e.target.value), 0, 10000000))} />
-            <Label className="ml-8">Your normal monthly split:</Label>
-            <Label>SQ/Scoot %</Label>
-            <Slider value={[normShares.s]} max={100} step={1} onValueChange={([v]) => setShareSQ(v)} className="w-24" />
-            <Label>DutyFree/FX %</Label>
-            <Slider value={[normShares.f]} max={100 - normShares.s} step={1} onValueChange={([v]) => setShareFX(v)} className="w-24" />
-            <Label>Other %</Label>
-            <span>{normShares.o}%</span>
-          </div>
-          <SpendPanel />
-          <CapPanel />
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
-            <Card className="rounded-xl border">
-              <CardContent className="p-4">
-                <div className="font-semibold mb-2">Months/Cycles until you reach your miles</div>
-                {pointChosen ? (
-                  <>
-                    <div className="text-lg font-bold">{pointChosen.months} cycles</div>
-                    <div className="text-sm text-zinc-600">Estimated total spend: {fmtTHB(pointChosen.spend)}</div>
-                    <div className="text-sm text-zinc-600">Effective THB per mile: {r2(pointChosen.thbPerMile)}</div>
-                    {card==="elite" && includeAnnualBonus && (
-                      <div className="text-xs mt-1 text-emerald-700">Annual bonus (25,000 miles) applies after THB 1M/year, posts after year end and renewal.</div>
-                    )}
-                    {card==="world" && includeSignupBonus && (
-                      <div className="text-xs mt-1 text-emerald-700">Sign-up bonus (5,000 miles) applies in month 1 if toggled.</div>
-                    )}
-                  </>
-                ) : (
-                  <div className="text-zinc-500">Increase cycles or monthly spend to hit your target.</div>
-                )}
-              </CardContent>
-            </Card>
-            <Card className="rounded-xl border">
-              <CardContent className="p-4">
-                <div className="font-semibold mb-2">Visualize Accrual</div>
-                <div className="h-56">
-                  <ResponsiveContainer>
-                    <LineChart data={sim}>
-                      <CartesianGrid strokeDasharray="3 3" />
-                      <XAxis dataKey="month" tickFormatter={v => `M${v}`} />
-                      <YAxis tickFormatter={v => `${(v as number / 1000).toFixed(0)}k`} />
-                      <RTooltip formatter={(v: any) => `${fmt(r0(v as number))} mi`} />
-                      <Line type="monotone" dataKey="cumMiles" strokeWidth={2} dot={false} name="Cumulative Miles" />
-                      <ReferenceLine y={chosenTargetMiles} stroke="#111" strokeDasharray="4 2" label={`Target (${fmt(r0(chosenTargetMiles))})`} />
-                    </LineChart>
-                  </ResponsiveContainer>
+            {/* ---- 'Learn the basics' explainer link ---- */}
+            <button className="mt-1 text-sm underline text-blue-500 hover:text-blue-600 focus:outline-none"
+              onClick={() => setShowExplainer(true)} type="button">
+              💡 Learn the basics
+            </button>
+          </motion.div>
+          <motion.div initial={{ opacity: 0, y: 24 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.21, duration: 0.4 }}
+            className="flex flex-col gap-2 md:flex-row md:items-center md:gap-3 mb-4 md:mb-3">
+            <div className="flex flex-col w-full md:w-auto space-y-2 md:space-y-0 md:flex-row md:items-center md:gap-2">
+              <div className="flex flex-col w-full mb-2 md:mb-0">
+                <Label htmlFor="target-select">Award Target Miles:</Label>
+                <Select value={target} onValueChange={(v) => { setTarget(v as TargetKey); setUseCustomTarget(false); }}>
+                  <SelectTrigger className="w-full md:w-52" id="target-select"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="saver">SQ Saver (122,500)</SelectItem>
+                    <SelectItem value="advantage">SQ Advantage (172,000)</SelectItem>
+                    <SelectItem value="star">Star Alliance OW (131,000)</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="flex flex-row items-center w-full md:w-auto gap-3 md:gap-1 mt-1 md:mt-0">
+                <Switch checked={useCustomTarget} onCheckedChange={setUseCustomTarget} />
+                <Label htmlFor="custom-miles-input" className="mb-0">Custom</Label>
+                <Input type="number" className="w-full md:w-24" id="custom-miles-input" value={customMiles} min={0} max={500000} onChange={e => setCustomMiles(clamp(Number(e.target.value), 0, 500000))} disabled={!useCustomTarget} />
+              </div>
+            </div>
+          </motion.div>
+          <motion.div initial={{ opacity: 0, y: 36 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.21, duration: 0.4 }}
+            className="flex flex-col gap-2 md:flex-row md:items-center md:gap-4 mb-4 md:mb-6">
+            <div className="flex flex-col w-full mb-2 md:mb-0">
+              <Label htmlFor="monthly-spend">Monthly Spend (THB):</Label>
+              <Input type="number" className="w-full md:w-36" id="monthly-spend" value={monthlySpendTHB} min={0} max={10000000} onChange={e => setMonthlySpendTHB(clamp(Number(e.target.value), 0, 10000000))} />
+            </div>
+            <div className="flex flex-col w-full gap-1">
+              <Label className="mb-1">Split:</Label>
+              <div className="flex flex-col sm:flex-row gap-2 sm:gap-4 w-full">
+                <div className="flex flex-col w-full max-w-xs mb-1">
+                  <div className="flex flex-row items-center justify-between mb-1">
+                    <Label>SQ/Scoot %</Label>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <span className="ml-1 text-zinc-400 cursor-help">ℹ️</span>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        Flight tickets, in-flight shopping
+                      </TooltipContent>
+                    </Tooltip>
+                    <span className="font-medium ml-1 text-zinc-700">{normShares.s}%</span>
+                  </div>
+                  <Slider value={[normShares.s]} max={100} step={1} onValueChange={([v]) => setShareSQ(v)} className="w-full" />
                 </div>
-              </CardContent>
-            </Card>
-          </div>
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-6">
-            <Card className="rounded-xl border">
-              <CardContent className="p-4 space-y-2">
-                <div className="text-md font-semibold mb-1">More info</div>
-                <ul className="list-disc pl-5 text-sm space-y-1 text-zinc-700">
-                  <li>More spend in SQ/Scoot/KrisShop bucket = faster earn (until cap, then next best is DutyFree/FX; try to keep largest spend below caps).</li>
-                  <li>Caps: {card === "elite" ? "THB 200,000/cycle for each (SQ&FX)" : "THB 100,000/cycle (SQ), THB 50,000/cycle (FX)"}</li>
-                  <li>If you spend more than cap, overflow goes to "other" rate (1 mile/THB 20).</li>
-                  <li>Exclusions: {EXCLUDED_MCCS} (see card T&Cs for full details).</li>
-                  <li>KrisFlyer miles are valid for 3 years after posting. Consider faster accrual + redeem sooner for best value.</li>
-                  <li>Elite: Annual bonus +25k miles after THB 1M/year (must renew).</li>
-                  <li>World: 5k signup promo bonus if toggled on.</li>
-                </ul>
-              </CardContent>
-            </Card>
-            <Card className="rounded-xl border">
-              <CardContent className="p-4 space-y-2">
-                <div className="text-md font-semibold mb-1">Category Rules (Official, condensed)</div>
-                <ul className="list-disc pl-5 text-sm space-y-1 text-zinc-700">
-                  <li>SQ/Scoot/KrisShop: {card === "elite" ? "1/12.5 (cap 200k/cycle)" : "1/15 (cap 100k/cycle)"}</li>
-                  <li>Duty Free/FX: 1/15 (cap {card === "elite" ? "200k" : "50k"}/cycle)</li>
-                  <li>Other: 1/20, includes overflow/uncategorized spend</li>
-                  <li>Annual bonus: Elite only, 25,000 miles on THB 1M/year (with renewal, posts after year).</li>
-                  <li>SignUp bonus: World only, 5,000 miles one-time (toggle in UI if eligible).</li>
-                </ul>
-              </CardContent>
-            </Card>
-          </div>
-          {expiryWarn && (
-            <div className="mt-4 p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 text-sm">
-              ⚠️ Expiry risk: at your current plan it may take {pointChosen?.months} cycles to reach the chosen award. Miles post about 10 days after each statement and expire 36 months after posting. Consider increasing monthly spend, improving earn mix, redeeming sooner, or aiming for a smaller target.
+                <div className="flex flex-col w-full max-w-xs mb-1">
+                  <div className="flex flex-row items-center justify-between mb-1">
+                    <Label>DutyFree/FX %</Label>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <span className="ml-1 text-zinc-400 cursor-help">ℹ️</span>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        Foreign-currency or duty-free purchases abroad
+                      </TooltipContent>
+                    </Tooltip>
+                    <span className="font-medium ml-1 text-zinc-700">{normShares.f}%</span>
+                  </div>
+                  <Slider value={[normShares.f]} max={100 - normShares.s} step={1} onValueChange={([v]) => setShareFX(v)} className="w-full" />
+                </div>
+                <div className="flex flex-col w-full max-w-xs mb-1">
+                  <div className="flex flex-row items-center justify-between mb-1">
+                    <Label>Other %</Label>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <span className="ml-1 text-zinc-400 cursor-help">ℹ️</span>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        Everything else (local THB spend)
+                      </TooltipContent>
+                    </Tooltip>
+                    <span className="font-medium ml-1 text-zinc-700">{normShares.o}%</span>
+                  </div>
+                  {/* no slider, just a value */}
+                </div>
+              </div>
             </div>
+          </motion.div>
+
+          <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.25, duration: 0.4 }}>
+            <RequiredSpendPanel chosenTargetMiles={chosenTargetMiles} rules={rules} normShares={normShares} monthlySpendTHB={monthlySpendTHB} />
+            <CompareSpendPanel chosenTargetMiles={chosenTargetMiles} card={card} rules={rules} monthlySpendTHB={monthlySpendTHB} />
+          </motion.div>
+          <motion.div className="mb-2 p-3 rounded bg-yellow-50 border-l-4 border-yellow-300 text-yellow-800 text-xs flex flex-col gap-1 mt-2">
+            <div className="font-bold mb-1"><span role="img" aria-label="warning">🚫</span> These types of payments don’t earn miles: groceries, petrol, bills, and e-wallet top-ups.</div>
+            <span>Excluded categories: MCC 5411 (supermarkets), MCC 5541 (gasoline), MCC 4900 (utilities), all e-wallet top-ups, PayAnything, Makro, spending in THB at overseas merchants, tax refunds, interest, and fees.</span>
+          </motion.div>
+          <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.28, duration: 0.4 }}>
+            <CapPanel card={card} />
+          </motion.div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-2 md:mt-4">
+            <motion.div initial={{ opacity: 0, y: 32 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.32, duration: 0.4 }}>
+              <Card className="rounded-xl border-2 border-amber-400 mb-4">
+                <CardContent className="p-4 space-y-2">
+                  <div className="text-lg font-bold mb-1 text-amber-600">How long to your miles goal?</div>
+                  <div className="flex gap-2 items-center mb-1">
+                    <span className="text-2xl font-bold">{pointChosen ? `${pointChosen.months} months at your pace` : 'N/A'}</span>
+                  </div>
+                  <div className="text-md">You’d need to spend about <span className="font-bold">{fmtTHB(pointChosen?.spend ?? 0)}</span> in total.</div>
+                  {card === "elite" && includeAnnualBonus && (
+                    <div className="flex items-center gap-1 text-xs mt-1 text-emerald-700">
+                      <span>Annual bonus (25,000 miles)</span>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <span className="ml-0.5 align-middle cursor-pointer text-zinc-400">ℹ️</span>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          Earns once per year if you spend ≥ 1M THB in that year. Posts after your card renewal.
+                        </TooltipContent>
+                      </Tooltip>
+                      <span>&mdash; if you spend 1M THB in a year. Paid after renewal.</span>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            </motion.div>
+            <motion.div initial={{ opacity: 0, y: 32 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.36, duration: 0.4 }}>
+              <Card className="rounded-xl border w-full">
+                <CardContent className="p-4">
+                  <div className="font-semibold mb-2">Visualize Accrual</div>
+                  <div className="overflow-x-auto">
+                    <MilesAccrualChart sim={sim} chosenTargetMiles={chosenTargetMiles} />
+                  </div>
+                </CardContent>
+              </Card>
+            </motion.div>
+          </div>
+
+          <InfoAccordion />
+
+          {pointChosen && pointChosen.months > 34 && (
+            <motion.div initial={{ opacity: 0, y: 36 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.48, duration: 0.4 }} className="mt-4 p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 text-sm">
+              ⚠️ Expiry risk: at your current plan it may take {pointChosen?.months} cycles to reach the chosen award. Miles post about 10 days after each statement and expire 36 months after posting. Consider increasing monthly spend, improving earn mix, redeeming sooner, or aiming for a smaller target.
+            </motion.div>
           )}
         </div>
       </div>
